@@ -1,0 +1,1 @@
+this is a project about customer service RAG
