@@ -3,6 +3,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain.chat_models import init_chat_model
 import os
 
 
@@ -148,10 +149,41 @@ def exercise_chain():
 
     return chain
 
+def get_model(name: str = "openai/gpt-5.6-luna-pro", temperature: float = 0.2,max_tokens: int = 1500,timeout: int = 60,max_retries: int = 3,cache: bool = True):
+    return init_chat_model(
+        model=name,
+        model_provider="openai",   # برای مدل‌های Anthropic عوضش کن
+        api_key=os.environ["KAYA_API_KEY"],
+        base_url="https://kayaai.ir/api",
+        temperature=temperature,
+    )
+
+
+def new_way():
+    """ Demonstrate a new way to create a chain using LCEL and Runnables """
+    # Component 1 : define the prompt template using LCEL
+    prompt=ChatPromptTemplate.from_template("you are a helpful financial assistant.. for your answek use TSE website and codal website . consider my risk tolerance as high. name one stock and tell why . gather data from the sources i said and do a fundamental analysis based on codal  . respond in english . answer in one sentence : {question}") 
+
+    model = get_model()
+
+    parser = StrOutputParser()
+
+    # Component 2 : compose with pipe operator
+    chain = prompt | model | parser
+
+    # Component 3 : execute the chain with an input
+    for chunk in chain.stream({"question": "What to buy in the iranian stock market now ?"}):
+        print(f"Result from the chain: {chunk},end='', flush=True")
+
+    return chain
+
+
+
 if __name__ == "__main__":
     # demo_basic_chain()
     # demo_batch_execution()
     # demo_streaming()
     # demo_schema_inspection()    
     # demo_streaming()
-    exercise_chain()
+    # exercise_chain()
+    new_way()
