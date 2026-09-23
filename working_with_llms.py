@@ -18,18 +18,17 @@ def get_model(name: str = "openai/gpt-5.6-luna-pro",
               temperature: float = 0.2,
               max_tokens: int = 1500,
               timeout: int = 60,
-              max_retries: int = 3,streaming: bool = True,cache: bool = True):
-    # provider را از پیشوند مدل استنتاج کن
-    provider = name.split("/")[0] if "/" in name else "openai"
+              max_retries: int = 3,cache: bool = True,streaming: bool = True):
     return init_chat_model(
         model=name,
-        model_provider=provider,
+        model_provider="openai",   # Kaya همه‌چیز را با فرمت OpenAI سرو می‌کند
         api_key=os.environ["KAYA_API_KEY"],
         base_url="https://kayaai.ir/api",
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
         max_retries=max_retries,
+        
     )
 
 
@@ -109,10 +108,41 @@ def demo_model_comparison_without_streaming():
         except Exception as e:
             print(f"⚠️ failed: {e}\n")
 
+
+def exercise_multi_model(question,model_names):
+    """
+    EXERCISE : create a function that : 
+    1.Takes a question and a list of model names 
+    2. Gets responses from all models 
+    3. Returns a dict of {moedel_name : response}
+    """
+
+    models={}
+    for model in model_names : 
+        models[model]=get_model(model)
+    
+    responses={}
+    for model_name , model in models.items():
+        try : 
+            response = model.invoke(question)
+            responses[model_name]=response.content
+        
+
+        except Exception as e :
+            print(f"failed : {e}\n")
+
+    return responses
+
+
+
+
+
 if __name__ == "__main__":
     # demo_init_chat_model()
     # demo_model_comparison()
-    demo_message()
+    # demo_message()
     # demo_model_comparison_without_streaming()
-
+    responses=exercise_multi_model("what is a RAG ?", model_names=["openai/gpt-5.6-luna-pro","meta/muse-spark-1.3-contributor","deepseek/deepseek-v4-pro-0813"])
+    for model,content in responses.items():
+        print(f"{model} : {content}")
 
