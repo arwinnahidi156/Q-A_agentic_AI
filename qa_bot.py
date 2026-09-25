@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 import httpx
 import openai
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field , PrivateAttr
 from langchain.chat_models import init_chat_model
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.globals import set_debug
@@ -113,7 +113,8 @@ class QAResponse(BaseModel):
     answer: str = Field(description="Clear, concise answer to the question")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence that the answer is correct, from 0.0 to 1.0")
     sources: List[Source] = Field(default_factory=list, description="References supporting the answer. Empty list if none")
-
+    _answered_by: str = PrivateAttr(default="")
+    _searched_with: str = PrivateAttr(default="")
 
 class SearchResult(BaseModel):
     """What the web search step returns (never sent to the model as a schema)."""
@@ -389,6 +390,11 @@ def ask(chain, question: str) -> QAResponse:
     if search and search.sources:
         resp.sources = search.sources
 
+    raw = result.get("raw") if result else None
+    meta = getattr(raw, "response_metadata", None) or {}
+    resp._answered_by = meta.get("model_name") or "unknown"
+    resp._searched_with = search.model if search else ""
+    
     return resp
 
 
@@ -435,6 +441,9 @@ def render(resp: QAResponse) -> None:
             print(f"   [{i}] {s.title}" + (f" | {s.url}" if s.url else ""))
     else:
         print("📚 Sources: none cited")
+    
+    print(f"🤖 Answered by: {resp._answered_by}"
+          + (f" | 🌐 searched with: {resp._searched_with}" if resp._searched_with else ""))
     print("-" * 60, flush=True)
 
 
