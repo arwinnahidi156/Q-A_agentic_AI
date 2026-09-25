@@ -1,3 +1,4 @@
+
 from dotenv import load_dotenv
 from langchain_core.prompts import (ChatPromptTemplate,
                                      FewShotChatMessagePromptTemplate,
@@ -65,7 +66,7 @@ def demo_str_parser():
     parser = StrOutputParser()
     
     chain = prompt | model | parser
-    result = chain.invoke()
+    result = chain.invoke({})
     print(f"Result : '{result}' (type : {type(result).__name__})")
     
 
@@ -255,5 +256,5 @@ if __name__ == "__main__":
     # demo_json_parser()
     # demo_pydantic_parser()
     # demo_structured_output()  
-    # demo_complex_schema()
-    exercise_structured_extraction()
+    demo_complex_schema()
+    # exercise_structured_extraction()
