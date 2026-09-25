@@ -1,1 +1,1 @@
-this is a project about customer service RAG
+this is a simple project about an Question and Answer bot with agentic AI 
