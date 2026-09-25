@@ -1,14 +1,12 @@
 """
-Terminal Q&A bot with web search
-question -> web_search (Perplexity Sonar on Kaya)
-         -> ChatPromptTemplate {question, context, today}
+Terminal Q&A bot with web search and conversation memory
+question -> (rewrite follow-up into a standalone search query)
+         -> web_search (Perplexity Sonar on Kaya)
+         -> ChatPromptTemplate {system, history, question, context, today}
          -> model.with_structured_output(QAResponse) -> QAResponse
+         -> save (question, answer) to short-term memory
 
-- Web search: real, current information with real source URLs
-- Structured output: answer + confidence + sources
-- Resilience: search-model fallbacks, answer-model fallbacks, parse retry, raw-text rescue
-- Graceful failure: if search fails, answer from memory; every error becomes a readable message
-- LangSmith tracing: controlled only by env vars (.env)
+Commands: /history  show memory | /reset  clear memory | exit  quit
 """
 import os
 import sys
@@ -23,11 +21,13 @@ from urllib.parse import urlparse
 import httpx
 import openai
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field , PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr
 from langchain.chat_models import init_chat_model
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.globals import set_debug
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tracers.langchain import wait_for_all_tracers
 from langsmith import traceable
 from langsmith.wrappers import wrap_openai
@@ -65,7 +65,7 @@ def _env_list(name: str, default: str) -> List[str]:
 # ------------------------------------------------------------------
 KAYA_BASE_URL = "https://kayaai.ir/api"
 MAX_QUESTION_CHARS = 2000
-PARSE_ATTEMPTS = 2                          # 1 normal try + 1 retry on bad structure
+PARSE_ATTEMPTS = 2
 MODEL_CANDIDATES = [
     "deepseek/deepseek-v4-pro-0813",        # primary
     "openai/gpt-5.6-luna-pro",              # fallback 1
@@ -75,12 +75,14 @@ MODEL_CANDIDATES = [
 DEBUG = _env_bool("QA_DEBUG", True)
 VERBOSE = _env_bool("QA_VERBOSE", False)
 REQUEST_TIMEOUT = _env_int("QA_TIMEOUT", 60)
-MAX_RETRIES = _env_int("QA_MAX_RETRIES", 2)
+MAX_RETRIES = _env_int("QA_MAX_RETRIES", 1)
 
 WEB_SEARCH = _env_bool("QA_WEB_SEARCH", True)
 SEARCH_MODELS = _env_list("QA_SEARCH_MODELS", "perplexity/sonar,perplexity/sonar-pro")
-SEARCH_TIMEOUT = _env_int("QA_SEARCH_TIMEOUT", 60)   # search is slower than a normal answer
+SEARCH_TIMEOUT = _env_int("QA_SEARCH_TIMEOUT", 60)
 MAX_SOURCES = 5
+
+MEMORY_TURNS = _env_int("QA_MEMORY_TURNS", 6)   # question/answer pairs kept; 0 = no memory
 
 # Kaya must never go through a proxy/VPN (it rejects foreign IPs)
 KAYA_HTTP_CLIENT = httpx.Client(trust_env=False)
@@ -113,8 +115,10 @@ class QAResponse(BaseModel):
     answer: str = Field(description="Clear, concise answer to the question")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence that the answer is correct, from 0.0 to 1.0")
     sources: List[Source] = Field(default_factory=list, description="References supporting the answer. Empty list if none")
+    # Private: not part of the schema, the model never sees or fills these
     _answered_by: str = PrivateAttr(default="")
     _searched_with: str = PrivateAttr(default="")
+
 
 class SearchResult(BaseModel):
     """What the web search step returns (never sent to the model as a schema)."""
@@ -124,7 +128,34 @@ class SearchResult(BaseModel):
 
 
 # ------------------------------------------------------------------
-# 2. Web search (Perplexity Sonar through Kaya)
+# 2. Short-term memory
+# ------------------------------------------------------------------
+class ConversationMemory:
+    """Keeps the last N question/answer turns in RAM (lost when the program exits)."""
+
+    def __init__(self, max_turns: int):
+        self.max_turns = max(0, max_turns)
+        self._messages: List[BaseMessage] = []
+
+    def add(self, question: str, answer: str) -> None:
+        self._messages += [HumanMessage(content=question), AIMessage(content=answer)]
+        excess = len(self._messages) - self.max_turns * 2
+        if excess > 0:
+            del self._messages[:excess]         # drop the oldest turns
+
+    @property
+    def messages(self) -> List[BaseMessage]:
+        return list(self._messages)             # a copy, so callers can't change the memory
+
+    def clear(self) -> None:
+        self._messages.clear()
+
+    def __len__(self) -> int:
+        return len(self._messages) // 2         # number of turns
+
+
+# ------------------------------------------------------------------
+# 3. Web search (Perplexity Sonar through Kaya)
 # ------------------------------------------------------------------
 SEARCH_SYSTEM_PROMPT = (
     "Search the web and report the facts that answer the user's question. "
@@ -135,11 +166,10 @@ SEARCH_SYSTEM_PROMPT = (
 
 @lru_cache(maxsize=1)
 def _search_client() -> openai.OpenAI:
-    """Raw OpenAI-format client for Kaya. wrap_openai makes each call show up in LangSmith."""
     client = openai.OpenAI(
         api_key=os.environ["KAYA_API_KEY"],
         base_url=KAYA_BASE_URL,
-        http_client=KAYA_HTTP_CLIENT,       # direct, no VPN
+        http_client=KAYA_HTTP_CLIENT,
         timeout=SEARCH_TIMEOUT,
         max_retries=MAX_RETRIES,
     )
@@ -147,7 +177,6 @@ def _search_client() -> openai.OpenAI:
 
 
 def _get(obj, key):
-    """Read a field from either a dict or an object."""
     if isinstance(obj, dict):
         return obj.get(key)
     return getattr(obj, key, None)
@@ -158,40 +187,27 @@ def _title_for(url: str, title: Optional[str]) -> str:
 
 
 def _extract_sources(resp) -> List[Source]:
-    """
-    Search models return citations in different formats depending on the gateway.
-    We read all three known formats and de-duplicate by URL, keeping the original order.
-    """
+    """Read citations in all three known formats, de-duplicated by URL."""
     found = {}
-
-    # 1) Perplexity native: search_results = [{"title", "url", "date"}, ...]
     for item in _get(resp, "search_results") or []:
         url = _get(item, "url")
         if url:
             found.setdefault(url, _title_for(url, _get(item, "title")))
-
-    # 2) Perplexity native: citations = ["https://...", ...]
     for url in _get(resp, "citations") or []:
         if isinstance(url, str) and url:
             found.setdefault(url, _title_for(url, None))
-
-    # 3) OpenAI/OpenRouter style: message.annotations = [{"type": "url_citation", "url_citation": {...}}]
     message = resp.choices[0].message if resp.choices else None
     for ann in _get(message, "annotations") or []:
         cit = _get(ann, "url_citation")
         url = _get(cit, "url") if cit else None
         if url:
             found.setdefault(url, _title_for(url, _get(cit, "title")))
-
     return [Source(title=title, url=url) for url, title in found.items()]
 
 
 @traceable(name="web_search", run_type="retriever")
-def web_search(question: str) -> Optional[SearchResult]:
-    """
-    Try each search model in order. Returns None if search is unavailable,
-    so the bot can still answer from memory. Key/credit errors are re-raised.
-    """
+def web_search(query: str) -> Optional[SearchResult]:
+    """Try each search model in order. None = search unavailable (not fatal)."""
     for model in SEARCH_MODELS:
         started = time.perf_counter()
         if DEBUG:
@@ -201,18 +217,18 @@ def web_search(question: str) -> Optional[SearchResult]:
                 model=model,
                 messages=[
                     {"role": "system", "content": SEARCH_SYSTEM_PROMPT},
-                    {"role": "user", "content": question},
+                    {"role": "user", "content": query},
                 ],
                 temperature=0.1,
                 max_tokens=1200,
             )
         except openai.APIStatusError as e:
-            if e.status_code in (401, 402):  # wrong key / no credit: other models won't help
+            if e.status_code in (401, 402):
                 raise
             if DEBUG:
                 print(f"   ❌ search failed ({model}): {type(e).__name__} {e.status_code}", flush=True)
             continue
-        except openai.APIError as e:         # timeout, connection error, ...
+        except openai.APIError as e:
             if DEBUG:
                 print(f"   ❌ search failed ({model}): {type(e).__name__}", flush=True)
             continue
@@ -220,11 +236,9 @@ def web_search(question: str) -> Optional[SearchResult]:
         text = (resp.choices[0].message.content or "").strip() if resp.choices else ""
         sources = _extract_sources(resp)[:MAX_SOURCES]
         if DEBUG:
-            secs = time.perf_counter() - started
-            print(f"   ✅ search done in {secs:.1f}s | {len(sources)} sources", flush=True)
+            print(f"   ✅ search done in {time.perf_counter() - started:.1f}s | {len(sources)} sources", flush=True)
         if text:
             return SearchResult(text=text, sources=sources, model=model)
-
     return None
 
 
@@ -241,31 +255,45 @@ def build_context(search: Optional[SearchResult]) -> str:
 
 
 # ------------------------------------------------------------------
-# 3. Prompt
+# 4. Prompts
 # ------------------------------------------------------------------
 SYSTEM_PROMPT = """You are a precise question-answering assistant. Today's date is {today}.
 Rules:
 - Answer directly and concisely.
-- If WEB RESULTS are provided, base your answer on them first. They are more current than
-  your own knowledge. Keep citation markers like 1, 2 that match the SOURCES list.
-  If the web results don't answer the question, say so.
+- Use the earlier conversation to understand follow-up questions (words like "it", "that",
+  "and in euros?"). For facts, the WEB RESULTS of the current question take priority over
+  anything said earlier.
+- If WEB RESULTS are provided, base your answer on them first. Keep citation markers like
+  1, 2 that match the SOURCES list. If they don't answer the question, say so.
 - If no WEB RESULTS are provided, answer from your own knowledge and LOWER the confidence
   for anything that may have changed recently.
 - confidence scale: 0.9-1.0 well-established fact | 0.6-0.8 likely, some uncertainty |
   0.3-0.5 partial/uncertain | below 0.3 mostly guessing.
-- If the question is ambiguous or unanswerable, say so in the answer and LOWER the confidence.
-- sources: when WEB RESULTS are provided, return an empty list (the real URLs are attached
+- If the question is ambiguous or unanswerable, say so and LOWER the confidence.
+- sources: when WEB RESULTS are provided, return an empty list (real URLs are attached
   automatically). Otherwise cite only real, well-known references and NEVER invent URLs.
 - Reply in the same language as the question."""
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_PROMPT),
+    MessagesPlaceholder("history", optional=True),   # past Q&A goes here
     ("human", "Question: {question}\n\n{context}"),
+])
+
+REWRITE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You turn a follow-up question into ONE standalone web search query. "
+     "Use the conversation to resolve references like 'it', 'that', 'and in euros?'. "
+     "Write the query in the language most likely to find good sources "
+     "(for example Persian for Iran-specific topics like the free-market rate). "
+     "Return ONLY the query text, nothing else."),
+    MessagesPlaceholder("history"),
+    ("human", "Follow-up question: {question}"),
 ])
 
 
 # ------------------------------------------------------------------
-# 4. Model + chain
+# 5. Models + chains
 # ------------------------------------------------------------------
 def get_model(name: str,
               temperature: float = 0.2,
@@ -274,36 +302,35 @@ def get_model(name: str,
               max_retries: int = MAX_RETRIES):
     return init_chat_model(
         model=name,
-        model_provider="openai",            # Kaya speaks the OpenAI API format
+        model_provider="openai",
         api_key=os.environ["KAYA_API_KEY"],
         base_url=KAYA_BASE_URL,
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
         max_retries=max_retries,
-        http_client=KAYA_HTTP_CLIENT,       # direct, no VPN
+        http_client=KAYA_HTTP_CLIENT,
     )
 
 
 def build_chain():
     structured_models = [
-        get_model(name).with_structured_output(
-            QAResponse,
-            method="function_calling",
-            include_raw=True,
-        )
+        get_model(name).with_structured_output(QAResponse, method="function_calling", include_raw=True)
         for name in MODEL_CANDIDATES
     ]
-    llm = structured_models[0].with_fallbacks(structured_models[1:])
-    return prompt | llm
+    return prompt | structured_models[0].with_fallbacks(structured_models[1:])
+
+
+def build_rewriter():
+    """Small, cheap call: follow-up question -> standalone search query (plain text)."""
+    models = [get_model(name, temperature=0.0, max_tokens=100) for name in MODEL_CANDIDATES]
+    return REWRITE_PROMPT | models[0].with_fallbacks(models[1:]) | StrOutputParser()
 
 
 # ------------------------------------------------------------------
-# 5. Live step printer (debug)
+# 6. Live step printer (debug)
 # ------------------------------------------------------------------
 class StepPrinter(BaseCallbackHandler):
-    """Prints what the LLM is doing, live, in the terminal."""
-
     def __init__(self):
         self._start = {}
 
@@ -312,14 +339,14 @@ class StepPrinter(BaseCallbackHandler):
         params = kwargs.get("invocation_params") or {}
         name = params.get("model") or params.get("model_name") or meta.get("ls_model_name", "model")
         self._start[run_id] = time.perf_counter()
-        print(f"   ⏳ answering with {name} ...", flush=True)
+        print(f"   ⏳ calling {name} ...", flush=True)
 
     def on_llm_end(self, response, *, run_id, **kwargs):
         secs = time.perf_counter() - self._start.pop(run_id, time.perf_counter())
         try:
             msg = response.generations[0][0].message
             usage = getattr(msg, "usage_metadata", None) or {}
-            tool = "tool call ✅" if getattr(msg, "tool_calls", None) else "NO tool call ⚠️"
+            tool = "tool call ✅" if getattr(msg, "tool_calls", None) else "text"
             tokens = usage.get("total_tokens", "?")
         except Exception:
             tool, tokens = "?", "?"
@@ -334,7 +361,7 @@ STEP_PRINTER = StepPrinter()
 
 
 # ------------------------------------------------------------------
-# 6. Core logic (one traced "turn" in LangSmith)
+# 7. Core logic
 # ------------------------------------------------------------------
 def _message_text(message) -> str:
     content = getattr(message, "content", "") or ""
@@ -346,28 +373,58 @@ def _message_text(message) -> str:
     return str(content).strip()
 
 
+def make_search_query(rewriter, question: str, history: List[BaseMessage], config: dict) -> str:
+    """No history -> the question as-is. With history -> a standalone query. Never fatal."""
+    if not history:
+        return question
+    try:
+        query = rewriter.invoke(
+            {"question": question, "history": history},
+            config={**config, "run_name": "rewrite_query"},
+        )
+    except openai.APIStatusError as e:
+        if e.status_code in (401, 402):
+            raise
+        log.warning("Query rewrite failed (%s), using the raw question", e.status_code)
+        return question
+    except openai.APIError as e:
+        log.warning("Query rewrite failed (%s), using the raw question", type(e).__name__)
+        return question
+    query = (query or "").strip().strip('"').strip()
+    return query[:300] or question
+
+
 @traceable(
     name="qa_turn",
     run_type="chain",
     tags=["qa-bot", "terminal"],
-    process_inputs=lambda inputs: {"question": inputs.get("question")},
+    process_inputs=lambda inputs: {
+        "question": inputs.get("question"),
+        "history_turns": len(inputs.get("history") or []) // 2,
+    },
 )
-def ask(chain, question: str) -> QAResponse:
-    # Step 1: search (optional, never fatal)
-    search = web_search(question) if WEB_SEARCH else None
-    if WEB_SEARCH and search is None and DEBUG:
-        print("   ⚠️  web search unavailable, answering from memory", flush=True)
-
-    # Step 2: structured answer grounded in the search results
-    inputs = {
-        "question": question,
-        "context": build_context(search),
-        "today": date.today().isoformat(),
-    }
+def ask(chain, rewriter, question: str, history: List[BaseMessage]) -> QAResponse:
     config = {"run_name": "qa_chain"}
     if DEBUG:
         config["callbacks"] = [STEP_PRINTER]
 
+    # Step 1: search (follow-ups are rewritten first so the search makes sense)
+    search = None
+    if WEB_SEARCH:
+        query = make_search_query(rewriter, question, history, config)
+        if DEBUG and query != question:
+            print(f"   🔁 search query: {query}", flush=True)
+        search = web_search(query)
+        if search is None and DEBUG:
+            print("   ⚠️  web search unavailable, answering from memory", flush=True)
+
+    # Step 2: structured answer, with the conversation history in the prompt
+    inputs = {
+        "question": question,
+        "history": history,
+        "context": build_context(search),
+        "today": date.today().isoformat(),
+    }
     resp = None
     result = None
     for attempt in range(1, PARSE_ATTEMPTS + 1):
@@ -377,7 +434,6 @@ def ask(chain, question: str) -> QAResponse:
             break
         log.warning("Structured parse failed (attempt %d): %s", attempt, result.get("parsing_error"))
 
-    # Salvage: model replied, but not in the schema -> raw text, or the search text itself
     if resp is None:
         raw_text = _message_text(result.get("raw")) if result else ""
         fallback = raw_text or (search.text if search else "")
@@ -386,23 +442,21 @@ def ask(chain, question: str) -> QAResponse:
             confidence=0.0,
         )
 
-    # Step 3: real URLs from the search replace anything the model remembered
+    # Step 3: real URLs from the search + which models actually did the work
     if search and search.sources:
         resp.sources = search.sources
-
     raw = result.get("raw") if result else None
     meta = getattr(raw, "response_metadata", None) or {}
     resp._answered_by = meta.get("model_name") or "unknown"
     resp._searched_with = search.model if search else ""
-    
     return resp
 
 
-def safe_ask(chain, question: str, session_id: str) -> Tuple[Optional[QAResponse], Optional[str]]:
-    """Graceful failure layer: turns every exception into a readable message."""
+def safe_ask(chain, rewriter, question: str, memory: ConversationMemory,
+             session_id: str) -> Tuple[Optional[QAResponse], Optional[str]]:
     extra = {"metadata": {"session_id": session_id}}
     try:
-        return ask(chain, question, langsmith_extra=extra), None
+        return ask(chain, rewriter, question, memory.messages, langsmith_extra=extra), None
     except openai.AuthenticationError:
         return None, "Authentication failed. Check KAYA_API_KEY."
     except openai.RateLimitError:
@@ -419,7 +473,7 @@ def safe_ask(chain, question: str, session_id: str) -> Tuple[Optional[QAResponse
 
 
 # ------------------------------------------------------------------
-# 7. Terminal UI
+# 8. Terminal UI
 # ------------------------------------------------------------------
 def validate(question: str) -> Tuple[Optional[str], Optional[str]]:
     q = question.strip()
@@ -441,10 +495,21 @@ def render(resp: QAResponse) -> None:
             print(f"   [{i}] {s.title}" + (f" | {s.url}" if s.url else ""))
     else:
         print("📚 Sources: none cited")
-    
     print(f"🤖 Answered by: {resp._answered_by}"
           + (f" | 🌐 searched with: {resp._searched_with}" if resp._searched_with else ""))
     print("-" * 60, flush=True)
+
+
+def show_history(memory: ConversationMemory) -> None:
+    if not len(memory):
+        print("🧠 Memory is empty.\n")
+        return
+    print(f"🧠 Memory ({len(memory)}/{memory.max_turns} turns):")
+    for msg in memory.messages:
+        who = "You" if isinstance(msg, HumanMessage) else "Bot"
+        text = str(msg.content).replace("\n", " ")
+        print(f"   {who}: {text[:100]}{'...' if len(text) > 100 else ''}")
+    print()
 
 
 def main():
@@ -455,13 +520,16 @@ def main():
     project = os.getenv("LANGSMITH_PROJECT", "default")
     print(f"🔍 LangSmith tracing: {'ON → project ' + project if tracing_on else 'OFF'}")
     print(f"🌐 Web search: {'ON → ' + ', '.join(SEARCH_MODELS) if WEB_SEARCH else 'OFF'}")
+    print(f"🧠 Memory: {'last ' + str(MEMORY_TURNS) + ' turns' if MEMORY_TURNS else 'OFF'}")
     if DEBUG:
         print(f"🛠  Debug: ON | timeout={REQUEST_TIMEOUT}s | search timeout={SEARCH_TIMEOUT}s | retries={MAX_RETRIES}")
-        print(f"🧠 Answer models (in order): {', '.join(MODEL_CANDIDATES)}")
+        print(f"🤖 Answer models (in order): {', '.join(MODEL_CANDIDATES)}")
 
     chain = build_chain()
+    rewriter = build_rewriter()
+    memory = ConversationMemory(MEMORY_TURNS)
     session_id = str(uuid.uuid4())
-    print("🤖 Ask me anything. Type 'exit' to quit.\n", flush=True)
+    print("💬 Ask me anything. Commands: /history, /reset, exit\n", flush=True)
 
     try:
         while True:
@@ -470,8 +538,17 @@ def main():
             except EOFError:
                 print()
                 break
-            if raw.strip().lower() in {"exit", "quit", "q"}:
+
+            command = raw.strip().lower()
+            if command in {"exit", "quit", "q"}:
                 break
+            if command == "/reset":
+                memory.clear()
+                print("🧹 Memory cleared.\n")
+                continue
+            if command == "/history":
+                show_history(memory)
+                continue
 
             question, err = validate(raw)
             if err:
@@ -480,7 +557,7 @@ def main():
 
             print("🤔 Thinking...", flush=True)
             started = time.perf_counter()
-            resp, err = safe_ask(chain, question, session_id)
+            resp, err = safe_ask(chain, rewriter, question, memory, session_id)
             if DEBUG:
                 print(f"   ⏱  total: {time.perf_counter() - started:.1f}s", flush=True)
 
@@ -488,6 +565,7 @@ def main():
                 print(f"⚠️  {err}\n", flush=True)
                 continue
             render(resp)
+            memory.add(question, resp.answer)   # only successful turns are remembered
     except KeyboardInterrupt:
         print()
     finally:
