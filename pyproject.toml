@@ -1,5 +1,5 @@
 [project]
-name = "ustoer-service-rag"
+name = "qa_agentic_ai"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -19,8 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ustoer-service-rag = "ustoer_service_rag:main"
+qa_agentic_ai = "qa_agentic_ai:main"
 
-[build-system]
-requires = ["uv_build>=0.12.17,<0.13.0"]
-build-backend = "uv_build"
+[tool.uv]
+package = false
